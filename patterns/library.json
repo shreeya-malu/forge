@@ -1,0 +1,196 @@
+{
+  "patterns": {
+    "rest_crud": {
+      "name": "REST CRUD Microservice",
+      "tiers": [1],
+      "description": "Standard CRUD microservice with REST API, schema validation, and persistent storage.",
+      "default_stack": {
+        "framework": "FastAPI",
+        "database": "SQLite (via SQLAlchemy)",
+        "validation": "Pydantic",
+        "testing": "pytest + httpx"
+      },
+      "directory_structure": [
+        "app/",
+        "app/main.py",
+        "app/models.py",
+        "app/schemas.py",
+        "app/database.py",
+        "app/routers/",
+        "app/routers/items.py",
+        "tests/",
+        "tests/test_api.py",
+        "requirements.txt",
+        "Dockerfile",
+        "docker-compose.yml"
+      ],
+      "task_templates": [
+        "Set up FastAPI application with database connection",
+        "Define SQLAlchemy models with strict schema validation",
+        "Implement Pydantic schemas for request/response validation",
+        "Implement CRUD router endpoints (GET, POST, PUT, DELETE)",
+        "Write comprehensive pytest test suite",
+        "Add error handling and input validation middleware",
+        "Create Dockerfile and docker-compose configuration"
+      ]
+    },
+    "rules_engine": {
+      "name": "Dynamic Business Rules Engine",
+      "tiers": [2],
+      "description": "Configurable rule engine for complex business logic with expression evaluation.",
+      "default_stack": {
+        "framework": "FastAPI",
+        "rule_engine": "Custom AST-based evaluator",
+        "storage": "JSON rule files + SQLite audit log",
+        "testing": "pytest with parametrised test cases"
+      },
+      "directory_structure": [
+        "app/",
+        "app/main.py",
+        "app/engine/",
+        "app/engine/rule_parser.py",
+        "app/engine/evaluator.py",
+        "app/engine/context.py",
+        "app/models.py",
+        "app/routers/rules.py",
+        "app/routers/evaluate.py",
+        "rules/",
+        "rules/sample_rules.json",
+        "tests/",
+        "tests/test_engine.py",
+        "tests/test_api.py"
+      ],
+      "task_templates": [
+        "Design rule schema and JSON rule file format",
+        "Implement rule parser with condition/action AST",
+        "Build expression evaluator with operator support",
+        "Implement rule execution context and variable binding",
+        "Create API endpoints for rule CRUD and evaluation",
+        "Add comprehensive test cases covering edge cases",
+        "Implement audit logging for rule evaluations"
+      ]
+    },
+    "api_integration": {
+      "name": "Third-Party API Integration Service",
+      "tiers": [3],
+      "description": "Async service integrating with external APIs with robust error handling and retries.",
+      "default_stack": {
+        "framework": "FastAPI",
+        "http_client": "httpx (async)",
+        "retry": "tenacity",
+        "caching": "Redis or in-memory TTL cache",
+        "testing": "pytest-asyncio + httpx mock"
+      },
+      "directory_structure": [
+        "app/",
+        "app/main.py",
+        "app/integrations/",
+        "app/integrations/base.py",
+        "app/integrations/client.py",
+        "app/integrations/retry.py",
+        "app/integrations/cache.py",
+        "app/models.py",
+        "app/routers/",
+        "tests/",
+        "tests/test_integration.py",
+        "tests/test_retry.py"
+      ],
+      "task_templates": [
+        "Set up async FastAPI application with lifespan",
+        "Implement base HTTP client with httpx and timeout config",
+        "Add retry logic with exponential backoff using tenacity",
+        "Implement response caching with TTL",
+        "Build error handling: 4xx, 5xx, network failures, timeouts",
+        "Create integration router with webhook support",
+        "Write async tests with mocked external API responses"
+      ]
+    },
+    "auth_service": {
+      "name": "OAuth2 + JWT Authentication Service with RBAC",
+      "tiers": [4],
+      "description": "Full authentication service with OAuth2 flows, JWT tokens, and role-based access control.",
+      "default_stack": {
+        "framework": "FastAPI",
+        "auth": "python-jose (JWT) + passlib (bcrypt)",
+        "database": "PostgreSQL via SQLAlchemy (async)",
+        "oauth2": "FastAPI OAuth2PasswordBearer",
+        "testing": "pytest-asyncio + factory-boy"
+      },
+      "directory_structure": [
+        "app/",
+        "app/main.py",
+        "app/core/",
+        "app/core/security.py",
+        "app/core/config.py",
+        "app/models/",
+        "app/models/user.py",
+        "app/models/role.py",
+        "app/routers/",
+        "app/routers/auth.py",
+        "app/routers/users.py",
+        "app/routers/admin.py",
+        "app/dependencies.py",
+        "tests/",
+        "tests/test_auth.py",
+        "tests/test_rbac.py"
+      ],
+      "task_templates": [
+        "Set up FastAPI with async PostgreSQL and Alembic migrations",
+        "Implement User and Role models with many-to-many relationship",
+        "Build JWT token creation, validation, and refresh logic",
+        "Implement OAuth2 password flow with bcrypt hashing",
+        "Create RBAC dependency injection system",
+        "Implement user registration, login, and token refresh endpoints",
+        "Add admin endpoints with role management",
+        "Write comprehensive auth and RBAC test suite"
+      ]
+    },
+    "mongo_join_engine": {
+      "name": "MongoDB SQL-Style Join Engine with Change Streams",
+      "tiers": [5],
+      "description": "Implements Inner, Left, Right, Full Outer joins on MongoDB with historical sync and live Change Streams.",
+      "default_stack": {
+        "framework": "FastAPI",
+        "database": "MongoDB (motor async driver)",
+        "streaming": "MongoDB Change Streams",
+        "sync": "Historical batch processor",
+        "testing": "pytest-asyncio + mongomock"
+      },
+      "directory_structure": [
+        "app/",
+        "app/main.py",
+        "app/engine/",
+        "app/engine/joins.py",
+        "app/engine/aggregation.py",
+        "app/engine/sync.py",
+        "app/engine/change_streams.py",
+        "app/models.py",
+        "app/routers/",
+        "app/routers/query.py",
+        "app/routers/sync.py",
+        "tests/",
+        "tests/test_joins.py",
+        "tests/test_sync.py",
+        "tests/test_change_streams.py"
+      ],
+      "task_templates": [
+        "Set up async FastAPI with Motor MongoDB client",
+        "Implement INNER JOIN using $lookup aggregation pipeline",
+        "Implement LEFT JOIN with null preservation",
+        "Implement RIGHT JOIN via collection swap + null preservation",
+        "Implement FULL OUTER JOIN by combining left + right with deduplication",
+        "Build historical data sync with batch processing and checkpointing",
+        "Implement Change Stream listener for live data updates",
+        "Create query API with join type selection and field projection",
+        "Write comprehensive join correctness test suite"
+      ]
+    }
+  },
+  "pattern_selection_rules": {
+    "tier_1": "rest_crud",
+    "tier_2": "rules_engine",
+    "tier_3": "api_integration",
+    "tier_4": "auth_service",
+    "tier_5": "mongo_join_engine"
+  }
+}

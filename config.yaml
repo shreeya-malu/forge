@@ -1,0 +1,49 @@
+# Forge Configuration
+llm:
+  provider: groq
+  planning_model: llama-3.3-70b-versatile    # reasoning / planning (70b is best available on Groq)
+  codegen_model: llama-3.3-70b-versatile     # code generation
+  fast_model: llama-3.1-8b-instant           # boilerplate, configs, non-Python files
+  temperature_reasoning: 0.2
+  temperature_codegen: 0.15                  # lower = more deterministic code
+  max_tokens: 2048                           # cap per call — prevents runaway usage
+  max_tokens_fast: 1024                      # cap for fast model calls
+  timeout: 90
+
+pipeline:
+  max_debug_retries: 3
+  max_security_fix_retries: 3
+  confidence_autonomous: 80      # above this → proceed autonomously
+  confidence_flag: 60            # below this → pause and ask user
+  checkpoint_on_low_confidence: true
+
+observability:
+  wandb_project: forge-hackathon
+  langsmith_project: forge-traces
+  enable_wandb: true
+  enable_langsmith: true
+  trace_agents:                  # only these agents get LangSmith traces
+    - RequirementAgent
+    - PlanningAgent
+    - ArchitectureValidatorAgent
+    - DebugAgent
+
+validators:
+  run_ruff: true
+  run_pylint: true
+  run_bandit: true
+  ruff_select: ["E", "F", "W", "I"]
+  pylint_disable: ["C0114", "C0115", "C0116"]
+
+output:
+  project_dir: ./generated_project
+  log_file: ./outputs/activity.log
+  summary_file: ./outputs/summary.json
+  security_report: ./outputs/security_report.json
+
+complexity_tiers:
+  1: { name: "The Ledger",       models: [planning_model, codegen_model] }
+  2: { name: "Logic Engine",     models: [planning_model, codegen_model] }
+  3: { name: "Live Bridge",      models: [planning_model, codegen_model] }
+  4: { name: "The Gatekeeper",   models: [planning_model, codegen_model] }
+  5: { name: "Mongo-SQL Engine", models: [planning_model, codegen_model] }

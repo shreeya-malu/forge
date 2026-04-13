@@ -1,0 +1,552 @@
+"""
+agents/codegen_agent.py
+
+Key design principles in this rewrite:
+1. MINIMAL PROMPTS — no full architecture JSON in every call. Pass only what the
+   current file actually needs: its interface contract + up to 2 relevant context files.
+2. SMART MODEL ROUTING — boilerplate files (__init__, config, requirements) use
+   llama-3.1-8b-instant. Complex logic files use llama-3.3-70b-versatile.
+3. TARGETED RETRIES — retry prompt contains ONLY the broken code + the exact error.
+   No re-sending full context on retry.
+4. ACCEPT WITH WARNINGS — validation only blocks on syntax errors and real ruff E-codes.
+   Pylint warnings/conventions are logged but do not trigger retry.
+5. WRITE TO DISK IMMEDIATELY — each generated file is written to disk right away so
+   subsequent files can import from it during pytest runs.
+"""
+from __future__ import annotations
+import json, time, os
+from pathlib import Path
+from core.llm import get_client
+from core.validators import validate_file, run_pytest, run_syntax_check
+from core.observability import log_action, log_agent_metrics, log_metric
+from core.state import ForgeState
+
+# ── Boilerplate file patterns — routed to fast model ─────────────────────────
+BOILERPLATE_PATTERNS = (
+    "__init__.py", "conftest.py", "config.py", "constants.py",
+    "requirements.txt", ".env.example", "setup.py",
+)
+
+# ── System prompts — kept SHORT intentionally ─────────────────────────────────
+CODEGEN_SYSTEM = """You are an expert Python developer. Write production-quality Python code.
+
+STRICT RULES:
+- Output ONLY raw Python code. No markdown. No ```python fences. No explanation.
+- First line must be a module docstring or an import statement.
+- Use type hints on all functions.
+- Handle exceptions explicitly. Never use bare `except:`.
+- No unused imports.
+- Keep it simple and correct."""
+
+RETRY_SYSTEM = """You are fixing broken Python code. 
+
+STRICT RULES:
+- Output ONLY the complete corrected Python file. No markdown. No explanation.
+- Fix ONLY the reported error. Do not change anything else.
+- The fix must be minimal and targeted."""
+
+BOILERPLATE_SYSTEM = """Write a Python file. Output ONLY the raw file content. No markdown fences."""
+
+
+def run(state: ForgeState) -> ForgeState:
+    log_action("CodeGenAgent", "Starting code generation pipeline")
+
+    task_plan       = state.get("task_plan", [])
+    architecture    = state.get("architecture", {})
+    spec            = state.get("structured_spec", {})
+    test_files      = state.get("test_files", {})
+    generated_files = state.get("generated_files", {})
+    priority_weights= state.get("priority_weights", {})
+    debug_attempts  = state.get("debug_attempts", {})
+    test_results    = state.get("test_results", {})
+    file_diffs      = state.get("file_diffs", [])
+    ruff_results    = state.get("ruff_results", {})
+    pylint_results  = state.get("pylint_results", {})
+
+    # Output directory — write files to disk immediately
+    project_dir = Path("./generated_project")
+    project_dir.mkdir(exist_ok=True)
+
+    client = get_client()
+    tasks_done = 0
+    tasks_failed = 0
+
+    # Build a compact architecture summary once — reused per file
+    arch_summary = _build_arch_summary(architecture, spec)
+
+    for task in task_plan:
+        if task["status"] != "pending":
+            continue
+
+        task["status"] = "in_progress"
+        log_action("CodeGenAgent", f"▶ Task {task['id']}: {task['title']}")
+
+        for filepath in task.get("files", []):
+            # Skip files QAAgent already wrote — don't overwrite TDD tests
+            if filepath in test_files:
+                log_action("CodeGenAgent",
+                           f"  ⏭ {filepath} already written by QAAgent — skipping")
+                # Make sure it's also on disk
+                if filepath not in generated_files:
+                    _accept_file(filepath, test_files[filepath], task, 0,
+                                 generated_files, file_diffs, project_dir)
+                continue
+
+            success = _generate_one_file(
+                state=state,
+                filepath=filepath,
+                task=task,
+                arch_summary=arch_summary,
+                priority_weights=priority_weights,
+                generated_files=generated_files,
+                client=client,
+                debug_attempts=debug_attempts,
+                ruff_results=ruff_results,
+                pylint_results=pylint_results,
+                file_diffs=file_diffs,
+                project_dir=project_dir,
+            )
+            if not success:
+                log_action("CodeGenAgent", f"  ✗ Failed after retries: {filepath}", level="WARN")
+
+        # Run tests for this task
+        test_file = task.get("test_file")
+        if test_file and test_file in test_files:
+            _run_task_tests(task, test_file, test_files, generated_files,
+                            test_results, project_dir)
+
+        # Task status
+        py_files = [f for f in task.get("files", []) if f.endswith(".py")]
+        placeholder_count = sum(
+            1 for f in py_files
+            if "PLACEHOLDER" in (generated_files.get(f) or "")[:80]
+        )
+        if placeholder_count == 0 and py_files:
+            task["status"] = "done"
+            tasks_done += 1
+        elif placeholder_count < len(py_files):
+            task["status"] = "done"   # partial success still counts
+            tasks_done += 1
+        else:
+            task["status"] = "failed"
+            tasks_failed += 1
+
+    metrics = {
+        "tasks_completed": tasks_done,
+        "tasks_failed": tasks_failed,
+        "files_generated": len(generated_files),
+        "first_attempt_pass_rate": _calc_first_attempt_rate(debug_attempts, generated_files),
+    }
+    log_agent_metrics("CodeGenAgent", metrics)
+    log_metric("codegen/files_generated", len(generated_files))
+    log_metric("codegen/first_attempt_pass_rate", metrics["first_attempt_pass_rate"])
+
+    state["generated_files"]  = generated_files
+    state["debug_attempts"]   = debug_attempts
+    state["test_results"]     = test_results
+    state["ruff_results"]     = ruff_results
+    state["pylint_results"]   = pylint_results
+    state["file_diffs"]       = file_diffs
+    state["task_plan"]        = task_plan
+    state["agent_metrics"]["CodeGenAgent"] = metrics
+    state["phase"]            = "codegen_done"
+
+    log_action("CodeGenAgent",
+               f"Code generation complete — {tasks_done} tasks done, {tasks_failed} failed")
+    return state
+
+
+# ── Core generation logic ──────────────────────────────────────────────────────
+
+def _generate_one_file(
+    state, filepath, task, arch_summary, priority_weights,
+    generated_files, client, debug_attempts, ruff_results,
+    pylint_results, file_diffs, project_dir,
+    max_retries=3,
+) -> bool:
+    """Generate a single file with targeted retries. Returns True on success."""
+
+    is_boilerplate = _is_boilerplate(filepath)
+    is_python      = filepath.endswith(".py")
+
+    # ── Non-Python files ───────────────────────────────────────────────────────
+    if not is_python:
+        return _generate_non_python(state, filepath, task, arch_summary,
+                                    client, generated_files, project_dir)
+
+    # ── Boilerplate Python files — fast model, single shot ────────────────────
+    if is_boilerplate:
+        return _generate_boilerplate(state, filepath, task, arch_summary,
+                                     client, generated_files, project_dir,
+                                     debug_attempts, file_diffs)
+
+    # ── Full Python file — build a focused prompt ─────────────────────────────
+    priority_hint   = _priority_hint(priority_weights)
+    context_snippet = _pick_context(filepath, generated_files, max_files=2, max_chars=800)
+    interfaces      = _extract_interfaces(filepath, architecture_summary=arch_summary)
+
+    first_prompt = _build_codegen_prompt(
+        filepath, task, arch_summary, priority_hint,
+        context_snippet, interfaces, prior_error=None,
+    )
+
+    attempt    = 0
+    last_error = None
+    last_code  = ""
+
+    while attempt < max_retries:
+        attempt += 1
+        debug_attempts[filepath] = attempt
+
+        if attempt == 1:
+            messages = [
+                {"role": "system", "content": CODEGEN_SYSTEM},
+                {"role": "user",   "content": first_prompt},
+            ]
+        else:
+            # Retry: send ONLY the broken code + exact error — no re-send of full context
+            messages = [
+                {"role": "system", "content": RETRY_SYSTEM},
+                {"role": "user",   "content": (
+                    f"File to fix: {filepath}\n\n"
+                    f"Error:\n{last_error}\n\n"
+                    f"Broken code:\n{last_code}\n\n"
+                    "Output the complete corrected file."
+                )},
+            ]
+
+        response, usage = client.call(messages, agent_name="CodeGenAgent")
+        _track(state, usage)
+
+        code = _clean_code(response)
+
+        # Quick sanity — if response is empty or too short, skip validation
+        if len(code.strip()) < 20:
+            last_error = "LLM returned empty or trivially short response"
+            last_code  = code
+            log_action("CodeGenAgent",
+                       f"  attempt {attempt}: empty response for {filepath}", level="WARN")
+            continue
+
+        # Validate
+        validation = validate_file(code, filepath)
+        ruff_results[filepath]   = validation.get("ruff")
+        pylint_results[filepath] = validation.get("pylint")
+
+        if validation["overall_passed"]:
+            _accept_file(filepath, code, task, attempt, generated_files,
+                         file_diffs, project_dir)
+            log_action("CodeGenAgent",
+                       f"  ✓ {filepath}",
+                       f"attempt={attempt} lines={len(code.splitlines())}")
+            return True
+        else:
+            last_error = validation.get("blocking_error") or "Validation failed"
+            last_code  = code
+            log_action("CodeGenAgent",
+                       f"  attempt {attempt}/{max_retries} failed: {filepath}",
+                       last_error[:120], "WARN")
+
+    # ── All retries exhausted ─────────────────────────────────────────────────
+    # Accept the last generated code anyway if it at least passes syntax
+    if last_code and run_syntax_check(last_code)["passed"]:
+        log_action("CodeGenAgent",
+                   f"  ⚠ Accepting with lint warnings: {filepath}", level="WARN")
+        _accept_file(filepath, last_code, task, attempt, generated_files,
+                     file_diffs, project_dir)
+        return True
+
+    # True failure — insert placeholder
+    placeholder = _make_placeholder(filepath, task, last_error)
+    _accept_file(filepath, placeholder, task, attempt, generated_files,
+                 file_diffs, project_dir, status="placeholder")
+    log_action("CodeGenAgent",
+               f"  ✗ PLACEHOLDER for {filepath}", last_error[:120], "ERROR")
+    return False
+
+
+def _generate_boilerplate(
+    state, filepath, task, arch_summary, client,
+    generated_files, project_dir, debug_attempts, file_diffs,
+) -> bool:
+    prompt = (
+        f"Write the Python file `{filepath}`.\n"
+        f"Purpose: {task.get('description', task.get('title', ''))[:300]}\n"
+        f"Stack: {arch_summary[:300]}\n\n"
+        "Output ONLY raw Python code."
+    )
+    messages = [
+        {"role": "system", "content": BOILERPLATE_SYSTEM},
+        {"role": "user",   "content": prompt},
+    ]
+    response, usage = client.call_fast(messages, agent_name="CodeGenAgent")
+    _track(state, usage)
+    code = _clean_code(response)
+
+    if not code.strip():
+        code = f'"""{filepath} — generated by Forge"""\n'
+
+    debug_attempts[filepath] = 1
+    _accept_file(filepath, code, task, 1, generated_files, file_diffs, project_dir)
+    log_action("CodeGenAgent", f"  ✓ {filepath} (boilerplate)")
+    return True
+
+
+def _generate_non_python(
+    state, filepath, task, arch_summary, client,
+    generated_files, project_dir,
+) -> bool:
+    prompt = (
+        f"Generate `{filepath}`.\n"
+        f"Context: {arch_summary[:400]}\n"
+        "Output ONLY the file content. No explanation."
+    )
+    response, usage = client.call_fast(
+        [{"role": "user", "content": prompt}], agent_name="CodeGenAgent"
+    )
+    _track(state, usage)
+    content = _clean_code(response)
+
+    generated_files[filepath] = content
+    out_path = project_dir / filepath
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(content)
+    log_action("CodeGenAgent", f"  ✓ {filepath} (non-Python)")
+    return True
+
+
+# ── Prompt builders ────────────────────────────────────────────────────────────
+
+def _build_codegen_prompt(
+    filepath, task, arch_summary, priority_hint,
+    context_snippet, interfaces, prior_error,
+) -> str:
+    parts = [
+        f"Write the Python file: `{filepath}`",
+        f"\nTask: {task['title']}",
+        f"Description: {task['description'][:400]}",
+        f"\nArchitecture context:\n{arch_summary}",
+    ]
+    if interfaces:
+        parts.append(f"\nInterfaces/contracts this file must implement:\n{interfaces}")
+    if context_snippet:
+        parts.append(f"\nRelevant existing code (for imports/interfaces):\n{context_snippet}")
+    parts.append(f"\nPriority: {priority_hint}")
+    if prior_error:
+        parts.append(f"\nPrevious attempt failed:\n{prior_error}")
+    parts.append(f"\nOutput ONLY the Python code for `{filepath}`. No markdown.")
+    return "\n".join(parts)
+
+
+def _build_arch_summary(architecture: dict, spec: dict) -> str:
+    """Build a compact, token-efficient architecture description."""
+    lines = []
+    summary = spec.get("project_summary", "")
+    if summary:
+        lines.append(f"Project: {summary[:200]}")
+
+    stack = spec.get("inferred_stack", {})
+    if stack:
+        lines.append("Stack: " + ", ".join(f"{k}={v}" for k, v in stack.items()))
+
+    decisions = architecture.get("key_decisions", [])
+    if decisions:
+        lines.append("Decisions:")
+        for d in decisions[:4]:  # max 4
+            lines.append(f"  - {d.get('decision','')}: {d.get('rationale','')[:80]}")
+
+    endpoints = architecture.get("api_endpoints", [])
+    if endpoints:
+        lines.append("Endpoints:")
+        for ep in endpoints[:6]:  # max 6
+            lines.append(f"  {ep.get('method','')} {ep.get('path','')} — {ep.get('description','')[:60]}")
+
+    models = architecture.get("data_models", [])
+    if models:
+        lines.append("Models:")
+        for m in models[:3]:
+            fields = ", ".join(
+                f"{f['name']}:{f['type']}" for f in m.get("fields", [])[:5]
+            )
+            lines.append(f"  {m.get('name','')}: {fields}")
+
+    return "\n".join(lines)
+
+
+def _pick_context(filepath: str, generated_files: dict,
+                  max_files: int = 2, max_chars: int = 800) -> str:
+    """
+    Pick the most relevant already-generated files as context.
+    Extracts the structurally important parts (imports, class/function signatures,
+    constants) rather than a raw line slice — so 800 chars covers real context.
+    """
+    if not generated_files:
+        return ""
+
+    fp_parts = set(Path(filepath).parts[:-1])
+    scored = []
+    for k, v in generated_files.items():
+        if k == filepath or "PLACEHOLDER" in (v or "")[:80]:
+            continue
+        k_parts = set(Path(k).parts[:-1])
+        # Score by directory overlap + penalise test files (less useful as context)
+        score = len(fp_parts & k_parts) - (1 if "test" in k else 0)
+        scored.append((score, k, v))
+
+    scored.sort(key=lambda x: -x[0])
+    selected = scored[:max_files]
+
+    snippets = []
+    for _, k, v in selected:
+        summary = _summarise_python_file(v, max_chars=max_chars // max(len(selected), 1))
+        if summary:
+            snippets.append(f"# {k}\n{summary}")
+
+    return "\n\n".join(snippets)
+
+
+def _summarise_python_file(code: str, max_chars: int = 400) -> str:
+    """
+    Extract structurally meaningful parts of a Python file:
+    imports, class/function signatures, decorators, key assignments.
+    Skips function bodies — the caller only needs to know what exists, not how it works.
+    """
+    if not code or len(code) < 10:
+        return ""
+
+    important = []
+    prev_was_def = False
+
+    for line in code.splitlines():
+        stripped = line.strip()
+
+        is_structural = (
+            stripped.startswith((
+                "import ", "from ", "class ", "def ", "async def ", "@",
+                "__all__", "app =", "router =", "db =", "engine =",
+                "Base =", "SessionLocal =", "DATABASE_URL",
+            ))
+            or "= Base" in stripped
+            or "Column(" in stripped
+            or "relationship(" in stripped
+        )
+
+        if is_structural:
+            important.append(line)
+            prev_was_def = stripped.startswith(("def ", "async def ", "class "))
+            continue
+
+        # Keep the first docstring line immediately after a def/class
+        if prev_was_def and stripped.startswith('"""'):
+            important.append(line)
+            prev_was_def = False
+            continue
+
+        prev_was_def = False
+
+    result = "\n".join(important)
+    if len(result) > max_chars:
+        result = result[:max_chars] + "\n# ..."
+    return result
+
+
+def _extract_interfaces(filepath: str, architecture_summary: str) -> str:
+    """Extract the API contract / interface hints relevant to this specific file."""
+    name = Path(filepath).stem.lower()
+    lines = [l for l in architecture_summary.splitlines()
+             if name in l.lower() or "endpoint" in l.lower()]
+    return "\n".join(lines[:10])
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _run_task_tests(task, test_file, test_files, generated_files,
+                    test_results, project_dir):
+    test_code  = test_files.get(test_file, "")
+    impl_files = [f for f in task.get("files", []) if f.endswith(".py")]
+    if not impl_files:
+        return
+
+    impl_filepath = impl_files[0]
+    impl_code = generated_files.get(impl_filepath, "")
+    if not impl_code or "PLACEHOLDER" in impl_code[:80]:
+        return
+
+    # Pass all generated files so cross-module imports (from app.models import ...)
+    # resolve correctly in the temp dir.
+    result = run_pytest(
+        test_code,
+        impl_code,
+        Path(impl_filepath).name,
+        all_generated_files=generated_files,
+    )
+    test_results[test_file] = result
+    status = "PASS" if result["passed"] else "FAIL"
+    log_action("CodeGenAgent", f"  Tests {status}: {test_file}",
+               f"passed={result['tests_passed']} failed={result['tests_failed']}")
+
+
+def _accept_file(filepath, code, task, attempt, generated_files,
+                 file_diffs, project_dir, status="generated"):
+    generated_files[filepath] = code
+    file_diffs.append({
+        "filepath": filepath,
+        "task_id":  task["id"],
+        "attempt":  attempt,
+        "lines":    len(code.splitlines()),
+        "status":   status,
+    })
+    out_path = project_dir / filepath
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(code)
+
+
+def _track(state, usage):
+    state["api_call_count"] = state.get("api_call_count", 0) + 1
+    state["total_tokens"]   = state.get("total_tokens", 0) + usage["total_tokens"]
+
+
+def _is_boilerplate(filepath: str) -> bool:
+    name = Path(filepath).name
+    return any(name == p or name.endswith(p) for p in BOILERPLATE_PATTERNS)
+
+
+def _clean_code(raw: str) -> str:
+    """Strip markdown fences. Handles ```python, ```py, ``` variants."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        # Drop first line (the fence opener) and find closing fence
+        end = len(lines) - 1
+        while end > 0 and lines[end].strip().startswith("```"):
+            end -= 1
+        raw = "\n".join(lines[1:end + 1])
+    return raw.strip()
+
+
+def _priority_hint(weights: dict) -> str:
+    if not weights:
+        return "balanced"
+    top = max(weights, key=weights.get)
+    return {
+        "security":      "security-first (validate inputs, parameterised queries, no eval)",
+        "quality":       "quality-first (type hints, error handling, docstrings)",
+        "test_coverage": "testability-first (pure functions, small units, no hidden state)",
+        "speed":         "speed-first (minimal working implementation)",
+        "simplicity":    "simplicity-first (explicit over clever)",
+    }.get(top, "balanced")
+
+
+def _make_placeholder(filepath: str, task: dict, error: str) -> str:
+    return (
+        f'"""PLACEHOLDER — {filepath}\nTask: {task["title"]}\n'
+        f'Generation failed. Error: {(error or "unknown")[:200]}\n"""\n\n'
+        f"raise NotImplementedError('Forge placeholder — manual implementation required')\n"
+    )
+
+
+def _calc_first_attempt_rate(debug_attempts: dict, generated_files: dict) -> float:
+    if not debug_attempts:
+        return 0.0
+    first_attempt = sum(1 for v in debug_attempts.values() if v == 1)
+    return round(first_attempt / len(debug_attempts) * 100, 1)
