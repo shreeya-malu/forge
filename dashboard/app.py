@@ -208,6 +208,88 @@ def _render_metrics(state: dict) -> str:
     </table>"""
 
 
+def _render_preview(state: dict) -> str:
+    files     = state.get("generated_files", {})
+    arch      = state.get("architecture", {})
+    stack     = state.get("inferred_stack", {})
+    summary   = state.get("workflow_summary", {})
+
+    if not files:
+        return "<i>No files generated yet.</i>"
+
+    py_files   = sorted(f for f in files if f.endswith(".py") and "PLACEHOLDER" not in (files[f] or "")[:80])
+    cfg_files  = sorted(f for f in files if not f.endswith(".py"))
+    total_lines = sum(len((files[f] or "").splitlines()) for f in py_files)
+
+    tree_rows = ""
+    for f in py_files + cfg_files:
+        lines = len((files[f] or "").splitlines())
+        icon  = "🐍" if f.endswith(".py") else ("🐳" if "docker" in f.lower() or f == "Dockerfile" else "📄")
+        tree_rows += f'<tr><td style="padding:3px 8px;font-family:monospace;font-size:0.85em">{icon} {f}</td><td style="padding:3px 8px;color:#718096;font-size:0.85em">{lines} lines</td></tr>'
+
+    req = files.get("requirements.txt", "")
+    req_html = ""
+    if req:
+        pkgs = [l.strip() for l in req.splitlines() if l.strip() and not l.startswith("#")]
+        req_html = "<b>Dependencies:</b> " + ", ".join(
+            f'<code style="background:#EDF2F7;padding:1px 4px;border-radius:3px">{p.split(">=")[0].split("==")[0]}</code>'
+            for p in pkgs[:12]
+        )
+        if len(pkgs) > 12:
+            req_html += f" +{len(pkgs)-12} more"
+
+    framework  = stack.get("framework", "FastAPI")
+    entrypoint = next((f.replace("/", ".").replace(".py", "") for f in py_files if f.endswith("main.py")), "app.main")
+    run_cmd    = f"uvicorn {entrypoint}:app --reload --port 8000" if "fastapi" in framework.lower() else "python -m app.main"
+
+    return f"""
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+      <div>
+        <div style="font-weight:bold;color:#0D1B2A;margin-bottom:8px">📁 Generated File Tree</div>
+        <table style="width:100%;border-collapse:collapse;background:#F7FAFC;border-radius:6px;overflow:hidden">
+          {tree_rows}
+        </table>
+        <div style="margin-top:8px;color:#718096;font-size:0.85em">
+          {len(py_files)} Python files · {len(cfg_files)} config files · {total_lines:,} total lines
+        </div>
+      </div>
+      <div>
+        <div style="font-weight:bold;color:#0D1B2A;margin-bottom:8px">🚀 How to run locally</div>
+        <div style="background:#1A202C;color:#E2E8F0;padding:12px;border-radius:6px;font-family:monospace;font-size:0.85em;line-height:1.8">
+          <span style="color:#68D391"># 1. Extract the downloaded ZIP</span><br>
+          cd generated_project<br><br>
+          <span style="color:#68D391"># 2. Install dependencies</span><br>
+          pip install -r requirements.txt<br><br>
+          <span style="color:#68D391"># 3. Run the server</span><br>
+          {run_cmd}<br><br>
+          <span style="color:#68D391"># 4. Open in browser</span><br>
+          http://localhost:8000/docs
+        </div>
+        <div style="margin-top:12px">{req_html}</div>
+        <div style="margin-top:12px">
+          <div style="font-weight:bold;color:#0D1B2A;margin-bottom:6px">🏗️ Stack</div>
+          {"".join(f'<span style="background:#EBF8FF;color:#1B4F8A;padding:3px 8px;border-radius:12px;font-size:0.85em;margin:2px;display:inline-block">{k}: {v}</span>' for k,v in stack.items())}
+        </div>
+      </div>
+    </div>
+    <div style="margin-top:16px;padding:12px;background:#F0FFF4;border-radius:6px;border:1px solid #27AE60">
+      <b style="color:#22543D">📊 Stats:</b>
+      <span style="color:#276749;margin-left:12px">{summary.get("tasks_completed",0)}/{summary.get("tasks_total",0)} tasks completed · {summary.get("test_pass_rate",0)}% tests passing · {summary.get("api_calls_total",0)} API calls · {summary.get("total_tokens",0):,} tokens used</span>
+    </div>"""
+
+
+def _make_zip() -> str:
+    import shutil
+    from pathlib import Path
+    project_dir = Path("./generated_project")
+    if not project_dir.exists():
+        return None
+    zip_path = "/tmp/forge_generated_project"
+    shutil.make_archive(zip_path, "zip", ".", "generated_project")
+    return zip_path + ".zip"
+
+
+
 def _render_summary(summary: dict) -> str:
     if not summary:
         return "<i>Pipeline not complete yet.</i>"
@@ -318,9 +400,27 @@ def create_dashboard():
             with gr.TabItem("🏗️ Architecture"):
                 arch_html = gr.HTML("<i>Architecture not generated yet.</i>")
 
-            with gr.TabItem("📁 Generated Files"):
-                file_selector = gr.Dropdown(label="Select file to view", choices=[], interactive=True)
-                file_content = gr.Code(label="File content", language="python")
+            with gr.TabItem("📁 Files & Editor"):
+                with gr.Row():
+                    file_selector = gr.Dropdown(
+                        label="Select file", choices=[], interactive=True, scale=3
+                    )
+                    download_btn = gr.Button("⬇ Download ZIP", size="sm", scale=1)
+                with gr.Row():
+                    file_content = gr.Code(
+                        label="File content (editable)",
+                        language="python",
+                        interactive=True,
+                        lines=28,
+                    )
+                with gr.Row():
+                    save_btn  = gr.Button("💾 Save changes", variant="primary", size="sm",
+                                          interactive=False)
+                    save_status = gr.HTML("")
+                download_file = gr.File(label="Download", visible=False)
+
+            with gr.TabItem("🚀 Project Preview"):
+                preview_html = gr.HTML("<i>Run the pipeline to see the project preview.</i>")
 
             with gr.TabItem("✅ Summary"):
                 summary_html = gr.HTML("<i>Pipeline not complete.</i>")
@@ -372,7 +472,7 @@ def create_dashboard():
                     gr.update(interactive=True),   # run_btn
                     gr.update(interactive=False),  # stop_btn
                     gr.update(visible=False),      # error_banner
-                    *([gr.update()] * 7),          # 7 tab html outputs
+                    *([gr.update()] * 8),          # 8 tab html outputs
                     "",                            # activity_log
                     gr.update(choices=[]),         # file_selector
                 )
@@ -541,6 +641,7 @@ def create_dashboard():
                     _render_tests(state.get("test_results", {})),
                     _render_security(state.get("security_findings", [])),
                     arch_text,
+                    _render_preview(state),
                     _render_summary(state.get("workflow_summary", {})),
                     log_lines,
                     gr.update(choices=files),
@@ -552,10 +653,51 @@ def create_dashboard():
         def view_file(filename):
             state = get_state()
             content = state.get("generated_files", {}).get(filename, "# File not found")
-            lang = ("python" if filename.endswith(".py")
-                    else "yaml" if filename.endswith((".yml", ".yaml"))
-                    else "markdown")
-            return gr.update(value=content, language=lang)
+            ext = filename.rsplit(".", 1)[-1] if "." in filename else ""
+            lang = {"py": "python", "yml": "yaml", "yaml": "yaml",
+                    "json": "json", "md": "markdown"}.get(ext, "python")
+            return gr.update(value=content, language=lang), gr.update(interactive=True), ""
+
+        def save_file(filename, new_content):
+            """Save edited file content back to state and disk."""
+            if not filename:
+                return gr.update(interactive=True), '<span style="color:#EB5757">No file selected</span>'
+            state = get_state()
+            files = state.get("generated_files", {})
+            files[filename] = new_content
+            state["generated_files"] = files
+            set_state(state)
+            # Write to disk
+            from pathlib import Path
+            out = Path("./generated_project") / filename
+            try:
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(new_content)
+                return gr.update(interactive=True), f'<span style="color:#27AE60">✅ Saved {filename}</span>'
+            except Exception as e:
+                return gr.update(interactive=True), f'<span style="color:#EB5757">Error: {e}</span>'
+
+        def download_zip():
+            zip_path = _make_zip()
+            if not zip_path:
+                return gr.update(visible=False)
+            return gr.update(value=zip_path, visible=True)
+
+        file_selector.change(
+            fn=view_file,
+            inputs=[file_selector],
+            outputs=[file_content, save_btn, save_status],
+        )
+        save_btn.click(
+            fn=save_file,
+            inputs=[file_selector, file_content],
+            outputs=[save_btn, save_status],
+        )
+        download_btn.click(
+            fn=download_zip,
+            inputs=[],
+            outputs=[download_file],
+        )
 
         def _classify_crash(err: str) -> str:
             """Return a human-friendly explanation of a crash cause."""
@@ -595,6 +737,7 @@ def create_dashboard():
                 tests_html,
                 security_html,
                 arch_html,
+                preview_html,
                 summary_html,
                 activity_log,
                 file_selector,
