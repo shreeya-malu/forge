@@ -406,18 +406,27 @@ def create_dashboard():
                         label="Select file", choices=[], interactive=True, scale=3
                     )
                     download_btn = gr.Button("⬇ Download ZIP", size="sm", scale=1)
+                file_content = gr.Textbox(
+                    label="File content (editable — select a file above)",
+                    lines=25,
+                    max_lines=60,
+                    interactive=True,
+                    show_copy_button=True,
+                )
                 with gr.Row():
-                    file_content = gr.Code(
-                        label="File content (editable)",
-                        language="python",
-                        interactive=True,
-                        lines=28,
-                    )
-                with gr.Row():
-                    save_btn  = gr.Button("💾 Save changes", variant="primary", size="sm",
-                                          interactive=False)
+                    save_btn   = gr.Button("💾 Save changes", variant="primary", size="sm",
+                                           interactive=False)
                     save_status = gr.HTML("")
-                download_file = gr.File(label="Download", visible=False)
+                gr.HTML('<hr style="margin:8px 0">')
+                gr.HTML('<div style="font-weight:bold;color:#0D1B2A;margin-bottom:4px">✏️ AI Edit — describe a change to apply to the selected file</div>')
+                with gr.Row():
+                    edit_prompt = gr.Textbox(
+                        placeholder='e.g. "Add a /expenses/summary endpoint that returns total by category"',
+                        label="", scale=4, lines=2,
+                    )
+                    ai_edit_btn = gr.Button("Apply change", variant="secondary", size="sm", scale=1)
+                ai_edit_status = gr.HTML("")
+                download_file  = gr.File(label="Download", visible=False)
 
             with gr.TabItem("🚀 Project Preview"):
                 preview_html = gr.HTML("<i>Run the pipeline to see the project preview.</i>")
@@ -651,23 +660,21 @@ def create_dashboard():
                     break
 
         def view_file(filename):
+            if not filename:
+                return "", gr.update(interactive=False), ""
             state = get_state()
-            content = state.get("generated_files", {}).get(filename, "# File not found")
-            ext = filename.rsplit(".", 1)[-1] if "." in filename else ""
-            lang = {"py": "python", "yml": "yaml", "yaml": "yaml",
-                    "json": "json", "md": "markdown"}.get(ext, "python")
-            return gr.update(value=content, language=lang), gr.update(interactive=True), ""
+            content = state.get("generated_files", {}).get(filename, "")
+            if not content:
+                return f"# {filename} — not found", gr.update(interactive=False), ""
+            # Return content as plain str — gr.Code/Textbox does not accept tuple
+            return content, gr.update(interactive=True), ""
 
         def save_file(filename, new_content):
-            """Save edited file content back to state and disk."""
             if not filename:
-                return gr.update(interactive=True), '<span style="color:#EB5757">No file selected</span>'
+                return gr.update(interactive=True), '<span style="color:#EB5757">⚠ No file selected</span>'
             state = get_state()
-            files = state.get("generated_files", {})
-            files[filename] = new_content
-            state["generated_files"] = files
+            state.setdefault("generated_files", {})[filename] = new_content
             set_state(state)
-            # Write to disk
             from pathlib import Path
             out = Path("./generated_project") / filename
             try:
@@ -675,7 +682,54 @@ def create_dashboard():
                 out.write_text(new_content)
                 return gr.update(interactive=True), f'<span style="color:#27AE60">✅ Saved {filename}</span>'
             except Exception as e:
-                return gr.update(interactive=True), f'<span style="color:#EB5757">Error: {e}</span>'
+                return gr.update(interactive=True), f'<span style="color:#EB5757">Save error: {e}</span>'
+
+        def ai_edit_file(filename, current_content, change_prompt):
+            """Apply a natural-language edit to the selected file using the LLM."""
+            if not filename:
+                return current_content, '<span style="color:#EB5757">⚠ No file selected</span>'
+            if not change_prompt.strip():
+                return current_content, '<span style="color:#EB5757">⚠ Describe the change to make</span>'
+            try:
+                from core.llm import get_client
+                client = get_client()
+                messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are editing a source file. Apply ONLY the requested change. "
+                            "Return the complete updated file as raw code. "
+                            "No markdown fences, no explanation."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"File: {filename}\n\n"
+                            f"Current content:\n{current_content[:4000]}\n\n"
+                            f"Change to apply: {change_prompt}\n\n"
+                            "Return the complete updated file."
+                        ),
+                    },
+                ]
+                response, _ = client.call(messages, agent_name="AIEditor")
+                new_code = response.strip()
+                if new_code.startswith("```"):
+                    lines = new_code.split("\n")
+                    end = len(lines) - 1
+                    while end > 0 and lines[end].strip().startswith("```"):
+                        end -= 1
+                    new_code = "\n".join(lines[1:end + 1]).strip()
+                from pathlib import Path
+                out = Path("./generated_project") / filename
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(new_code)
+                state = get_state()
+                state.setdefault("generated_files", {})[filename] = new_code
+                set_state(state)
+                return new_code, f'<span style="color:#27AE60">✅ Applied: {change_prompt[:60]}</span>'
+            except Exception as e:
+                return current_content, f'<span style="color:#EB5757">Error: {e}</span>'
 
         def download_zip():
             zip_path = _make_zip()
@@ -692,6 +746,11 @@ def create_dashboard():
             fn=save_file,
             inputs=[file_selector, file_content],
             outputs=[save_btn, save_status],
+        )
+        ai_edit_btn.click(
+            fn=ai_edit_file,
+            inputs=[file_selector, file_content, edit_prompt],
+            outputs=[file_content, ai_edit_status],
         )
         download_btn.click(
             fn=download_zip,
@@ -743,8 +802,6 @@ def create_dashboard():
                 file_selector,
             ],
         )
-
-        file_selector.change(fn=view_file, inputs=[file_selector], outputs=[file_content])
 
     return demo
 
