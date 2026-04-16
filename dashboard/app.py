@@ -411,7 +411,6 @@ def create_dashboard():
                     lines=25,
                     max_lines=60,
                     interactive=True,
-                    show_copy_button=True,
                 )
                 with gr.Row():
                     save_btn   = gr.Button("💾 Save changes", variant="primary", size="sm",

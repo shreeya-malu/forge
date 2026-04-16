@@ -1,78 +1,130 @@
 """
-agents/codegen_agent.py
+agents/codegen_agent.py  —  Forge Engineering Intelligence System
 
-Key design principles in this rewrite:
-1. MINIMAL PROMPTS — no full architecture JSON in every call. Pass only what the
-   current file actually needs: its interface contract + up to 2 relevant context files.
-2. SMART MODEL ROUTING — boilerplate files (__init__, config, requirements) use
-   llama-3.1-8b-instant. Complex logic files use llama-3.3-70b-versatile.
-3. TARGETED RETRIES — retry prompt contains ONLY the broken code + the exact error.
-   No re-sending full context on retry.
-4. ACCEPT WITH WARNINGS — validation only blocks on syntax errors and real ruff E-codes.
-   Pylint warnings/conventions are logged but do not trigger retry.
-5. WRITE TO DISK IMMEDIATELY — each generated file is written to disk right away so
-   subsequent files can import from it during pytest runs.
+The core problem this file solves:
+  An LLM generating code file-by-file will hallucinate imports, redefine shared
+  objects (Base, engine, app), use deprecated APIs (Pydantic v1, old SQLAlchemy
+  declarative_base), and treat POST bodies as query params — because its training
+  data is full of these patterns and it has no explicit contract to follow.
+
+The solution:
+  Before generating any file, derive a PER-FILE CONTRACT that specifies:
+    - Exact imports the file must use (and where from)
+    - Exact classes / functions to define
+    - Framework version patterns to follow (Pydantic v2, SQLAlchemy 2.x, etc.)
+    - What NOT to define (shared objects defined elsewhere)
+  The LLM generates code to satisfy this contract. The contract is also used
+  during retry so the fix is targeted at the actual root cause.
 """
 from __future__ import annotations
-import json, time, os
+import time
 from pathlib import Path
+
 from core.llm import get_client
 from core.validators import validate_file, run_pytest, run_syntax_check
 from core.observability import log_action, log_agent_metrics, log_metric
 from core.state import ForgeState
 
-# ── Boilerplate file patterns — routed to fast model ─────────────────────────
+
+# ── Boilerplate file patterns — use fast model, single shot ───────────────────
 BOILERPLATE_PATTERNS = (
-    "__init__.py", "conftest.py", "config.py", "constants.py",
-    "requirements.txt", ".env.example", "setup.py",
+    "__init__.py", "conftest.py", "constants.py", ".env.example", "setup.py",
 )
 
-# ── System prompts — kept SHORT intentionally ─────────────────────────────────
-CODEGEN_SYSTEM = """You are an expert Python developer. Write production-quality Python code.
+# ── Framework version patterns injected into every prompt ─────────────────────
+FRAMEWORK_PATTERNS = {
+    "fastapi": """
+FastAPI patterns to follow:
+- Import: from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, Query
+- Use APIRouter with prefix, not bare @app decorators in router files
+- POST/PUT bodies: always use a Pydantic schema parameter (body: SchemaName), NEVER query params
+- Dependency injection: def get_db() -> Generator[Session, None, None] in database.py, use Depends(get_db)
+- Use lifespan context manager for startup (not @app.on_event)
+- Return proper HTTP status codes: 201 for create, 204 for delete, 404 for not found
+- Use HTTPException(status_code=404, detail="...") not return {"error": "..."}
+""",
+    "pydantic_v2": """
+Pydantic v2 patterns (REQUIRED — do NOT use v1 patterns):
+- Use: from pydantic import BaseModel, field_validator, ConfigDict
+- Class config: model_config = ConfigDict(from_attributes=True)  ← NOT class Config: orm_mode = True
+- Validators: @field_validator('field_name') @classmethod def name(cls, v): ...
+- Do NOT use: @validator, orm_mode, class Config
+""",
+    "sqlalchemy_2": """
+SQLAlchemy 2.x patterns (REQUIRED — do NOT use legacy patterns):
+- Base: class Base(DeclarativeBase): pass  ← NOT declarative_base()
+- Import: from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+- Engine: from sqlalchemy import create_engine
+- Session dependency yields Session, not SessionLocal()
+- Models inherit from Base (defined ONCE in database.py — import it, never redefine)
+- Use mapped_column() for columns: id: Mapped[int] = mapped_column(primary_key=True)
+  OR classic Column() syntax — pick one and be consistent across all model files
+""",
+}
 
-STRICT RULES:
-- Output ONLY raw Python code. No markdown. No ```python fences. No explanation.
-- First line must be a module docstring or an import statement.
-- Use type hints on all functions.
-- Handle exceptions explicitly. Never use bare `except:`.
-- No unused imports.
-- Keep it simple and correct."""
 
-RETRY_SYSTEM = """You are fixing broken Python code. 
+# ── System prompts ─────────────────────────────────────────────────────────────
 
-STRICT RULES:
-- Output ONLY the complete corrected Python file. No markdown. No explanation.
-- Fix ONLY the reported error. Do not change anything else.
-- The fix must be minimal and targeted."""
+CODEGEN_SYSTEM = """You are an expert Python developer generating production code for a software project.
 
-BOILERPLATE_SYSTEM = """Write a Python file. Output ONLY the raw file content. No markdown fences."""
+ABSOLUTE RULES — violating any of these causes the build to fail:
+1. Output ONLY raw Python code. Zero markdown. Zero ``` fences. Zero explanation.
+2. The very first character must be `"` (docstring) or a letter (import/code).
+3. Follow the EXACT import paths specified in the contract — never import from a module not listed.
+4. Never redefine objects that the contract says are defined elsewhere (Base, engine, app, router, etc.).
+5. POST/PUT endpoints always take a Pydantic schema as the request body, never query params.
+6. Use the framework version patterns specified — Pydantic v2, SQLAlchemy 2.x, FastAPI lifespan.
+7. Every function must have type hints. No bare `except:`. No unused imports."""
 
+RETRY_SYSTEM = """You are fixing a Python file that failed validation.
+
+RULES:
+1. Output ONLY the complete corrected file. No markdown. No explanation.
+2. Read the error carefully and fix the ROOT CAUSE, not just the symptom.
+3. If the error says "Base not defined" — add the correct import from the contract.
+4. If the error says "query param" issue — change to a Pydantic body schema.
+5. Do not change anything unrelated to the reported error."""
+
+EXTEND_SYSTEM = """You are extending an existing Python file with new functionality.
+
+RULES:
+1. Output the COMPLETE file — all existing code PLUS the new additions.
+2. Never remove or modify existing functions/classes.
+3. Add new code below the existing code.
+4. Match the existing code style exactly.
+5. No markdown. No explanation. Raw Python only."""
+
+BOILERPLATE_SYSTEM = "Write a Python file. Output ONLY raw Python code. No markdown fences. No explanation."
+
+
+# ── Main entry point ──────────────────────────────────────────────────────────
 
 def run(state: ForgeState) -> ForgeState:
     log_action("CodeGenAgent", "Starting code generation pipeline")
 
-    task_plan       = state.get("task_plan", [])
-    architecture    = state.get("architecture", {})
-    spec            = state.get("structured_spec", {})
-    test_files      = state.get("test_files", {})
-    generated_files = state.get("generated_files", {})
-    priority_weights= state.get("priority_weights", {})
-    debug_attempts  = state.get("debug_attempts", {})
-    test_results    = state.get("test_results", {})
-    file_diffs      = state.get("file_diffs", [])
-    ruff_results    = state.get("ruff_results", {})
-    pylint_results  = state.get("pylint_results", {})
+    task_plan        = state.get("task_plan", [])
+    architecture     = state.get("architecture", {})
+    spec             = state.get("structured_spec", {})
+    test_files       = state.get("test_files", {})
+    generated_files  = state.get("generated_files", {})
+    priority_weights = state.get("priority_weights", {})
+    debug_attempts   = state.get("debug_attempts", {})
+    test_results     = state.get("test_results", {})
+    file_diffs       = state.get("file_diffs", [])
+    ruff_results     = state.get("ruff_results", {})
+    pylint_results   = state.get("pylint_results", {})
 
-    # Output directory — write files to disk immediately
     project_dir = Path("./generated_project")
     project_dir.mkdir(exist_ok=True)
 
     client = get_client()
-    tasks_done = 0
+    tasks_done   = 0
     tasks_failed = 0
 
-    # Build a compact architecture summary once — reused per file
-    arch_summary = _build_arch_summary(architecture, spec)
+    # ── Build project-wide context once ──────────────────────────────────────
+    stack        = spec.get("inferred_stack", {})
+    fw_patterns  = _detect_framework_patterns(stack, architecture)
+    file_registry= {}  # filepath → {role, defines, exports} — built as files generate
 
     for task in task_plan:
         if task["status"] != "pending":
@@ -82,27 +134,37 @@ def run(state: ForgeState) -> ForgeState:
         log_action("CodeGenAgent", f"▶ Task {task['id']}: {task['title']}")
 
         for filepath in task.get("files", []):
-            # Skip files QAAgent already wrote — don't overwrite TDD tests
+
+            # ── Skip QAAgent test files ───────────────────────────────────────
             if filepath in test_files:
-                log_action("CodeGenAgent",
-                           f"  ⏭ {filepath} already written by QAAgent — skipping")
+                log_action("CodeGenAgent", f"  ⏭ {filepath} (QAAgent) — skipping")
                 if filepath not in generated_files:
                     _accept_file(filepath, test_files[filepath], task, 0,
                                  generated_files, file_diffs, project_dir)
                 continue
 
-            # If this file was already generated by an earlier task (shared file
-            # e.g. app/routes.py written across multiple tasks), pass existing
-            # content as context so the new task EXTENDS it rather than replacing it.
+            # ── Check for shared file (already generated, needs extension) ───
             existing = generated_files.get(filepath, "")
-            is_shared = bool(existing and "PLACEHOLDER" not in existing[:80])
+            is_extension = bool(existing and "PLACEHOLDER" not in existing[:80])
+
+            # ── Build per-file contract ───────────────────────────────────────
+            contract = _build_file_contract(
+                filepath=filepath,
+                task=task,
+                architecture=architecture,
+                spec=spec,
+                generated_files=generated_files,
+                file_registry=file_registry,
+                fw_patterns=fw_patterns,
+                is_extension=is_extension,
+                existing_content=existing,
+            )
 
             success = _generate_one_file(
                 state=state,
                 filepath=filepath,
                 task=task,
-                arch_summary=arch_summary,
-                priority_weights=priority_weights,
+                contract=contract,
                 generated_files=generated_files,
                 client=client,
                 debug_attempts=debug_attempts,
@@ -110,18 +172,23 @@ def run(state: ForgeState) -> ForgeState:
                 pylint_results=pylint_results,
                 file_diffs=file_diffs,
                 project_dir=project_dir,
-                existing_content=existing if is_shared else "",
+                is_extension=is_extension,
+                existing_content=existing,
             )
-            if not success:
-                log_action("CodeGenAgent", f"  ✗ Failed after retries: {filepath}", level="WARN")
 
-        # Run tests for this task
+            if not success:
+                log_action("CodeGenAgent", f"  ✗ Failed: {filepath}", level="WARN")
+            else:
+                # Update file registry so later files can reference this one
+                _register_file(filepath, generated_files.get(filepath, ""), file_registry)
+
+        # ── Run tests for this task ───────────────────────────────────────────
         test_file = task.get("test_file")
         if test_file and test_file in test_files:
             _run_task_tests(task, test_file, test_files, generated_files,
                             test_results, project_dir)
 
-        # Task status
+        # ── Task status ───────────────────────────────────────────────────────
         py_files = [f for f in task.get("files", []) if f.endswith(".py")]
         placeholder_count = sum(
             1 for f in py_files
@@ -131,74 +198,63 @@ def run(state: ForgeState) -> ForgeState:
             task["status"] = "done"
             tasks_done += 1
         elif placeholder_count < len(py_files):
-            task["status"] = "done"   # partial success still counts
+            task["status"] = "done"
             tasks_done += 1
         else:
             task["status"] = "failed"
             tasks_failed += 1
 
     metrics = {
-        "tasks_completed": tasks_done,
-        "tasks_failed": tasks_failed,
-        "files_generated": len(generated_files),
+        "tasks_completed":       tasks_done,
+        "tasks_failed":          tasks_failed,
+        "files_generated":       len(generated_files),
         "first_attempt_pass_rate": _calc_first_attempt_rate(debug_attempts, generated_files),
     }
     log_agent_metrics("CodeGenAgent", metrics)
     log_metric("codegen/files_generated", len(generated_files))
     log_metric("codegen/first_attempt_pass_rate", metrics["first_attempt_pass_rate"])
 
-    state["generated_files"]  = generated_files
-    state["debug_attempts"]   = debug_attempts
-    state["test_results"]     = test_results
-    state["ruff_results"]     = ruff_results
-    state["pylint_results"]   = pylint_results
-    state["file_diffs"]       = file_diffs
-    state["task_plan"]        = task_plan
+    state["generated_files"]              = generated_files
+    state["debug_attempts"]               = debug_attempts
+    state["test_results"]                 = test_results
+    state["ruff_results"]                 = ruff_results
+    state["pylint_results"]               = pylint_results
+    state["file_diffs"]                   = file_diffs
+    state["task_plan"]                    = task_plan
     state["agent_metrics"]["CodeGenAgent"] = metrics
-    state["phase"]            = "codegen_done"
+    state["phase"]                        = "codegen_done"
 
     log_action("CodeGenAgent",
                f"Code generation complete — {tasks_done} tasks done, {tasks_failed} failed")
     return state
 
 
-# ── Core generation logic ──────────────────────────────────────────────────────
+# ── Core generation ───────────────────────────────────────────────────────────
 
 def _generate_one_file(
-    state, filepath, task, arch_summary, priority_weights,
-    generated_files, client, debug_attempts, ruff_results,
-    pylint_results, file_diffs, project_dir,
+    state, filepath, task, contract,
+    generated_files, client, debug_attempts,
+    ruff_results, pylint_results, file_diffs, project_dir,
     max_retries=3,
+    is_extension=False,
     existing_content="",
 ) -> bool:
-    """Generate a single file with targeted retries. Returns True on success."""
+    is_python = filepath.endswith(".py")
 
-    is_boilerplate = _is_boilerplate(filepath)
-    is_python      = filepath.endswith(".py")
-
-    # ── Non-Python files ───────────────────────────────────────────────────────
     if not is_python:
-        return _generate_non_python(state, filepath, task, arch_summary,
-                                    client, generated_files, project_dir)
+        return _generate_non_python(state, filepath, contract, client,
+                                    generated_files, project_dir)
 
-    # ── Boilerplate Python files — fast model, single shot ────────────────────
-    if is_boilerplate:
-        return _generate_boilerplate(state, filepath, task, arch_summary,
-                                     client, generated_files, project_dir,
+    if _is_boilerplate(filepath):
+        return _generate_boilerplate(state, filepath, contract, client,
+                                     generated_files, project_dir,
                                      debug_attempts, file_diffs)
 
-    # ── Full Python file — build a focused prompt ─────────────────────────────
-    priority_hint   = _priority_hint(priority_weights)
-    context_snippet = _pick_context(filepath, generated_files, max_files=2, max_chars=800)
-    interfaces      = _extract_interfaces(filepath, architecture_summary=arch_summary)
+    system = EXTEND_SYSTEM if is_extension else CODEGEN_SYSTEM
+    first_user = _build_user_prompt(filepath, task, contract,
+                                    existing_content if is_extension else "")
 
-    first_prompt = _build_codegen_prompt(
-        filepath, task, arch_summary, priority_hint,
-        context_snippet, interfaces, prior_error=None,
-        existing_content=existing_content,
-    )
-
-    attempt    = 0
+    attempt   = 0
     last_error = None
     last_code  = ""
 
@@ -208,16 +264,18 @@ def _generate_one_file(
 
         if attempt == 1:
             messages = [
-                {"role": "system", "content": CODEGEN_SYSTEM},
-                {"role": "user",   "content": first_prompt},
+                {"role": "system", "content": system},
+                {"role": "user",   "content": first_user},
             ]
         else:
-            # Retry: send ONLY the broken code + exact error — no re-send of full context
+            # Retry: include the contract so the fix is grounded
+            contract_summary = _contract_to_text(contract)
             messages = [
                 {"role": "system", "content": RETRY_SYSTEM},
                 {"role": "user",   "content": (
-                    f"File to fix: {filepath}\n\n"
-                    f"Error:\n{last_error}\n\n"
+                    f"File: {filepath}\n\n"
+                    f"Contract (what this file must do):\n{contract_summary}\n\n"
+                    f"Error to fix:\n{last_error}\n\n"
                     f"Broken code:\n{last_code}\n\n"
                     "Output the complete corrected file."
                 )},
@@ -228,24 +286,19 @@ def _generate_one_file(
 
         code = _clean_code(response)
 
-        # Quick sanity — if response is empty or too short, skip validation
-        if len(code.strip()) < 20:
+        if len(code.strip()) < 30:
             last_error = "LLM returned empty or trivially short response"
             last_code  = code
-            log_action("CodeGenAgent",
-                       f"  attempt {attempt}: empty response for {filepath}", level="WARN")
             continue
 
-        # Validate
         validation = validate_file(code, filepath)
         ruff_results[filepath]   = validation.get("ruff")
         pylint_results[filepath] = validation.get("pylint")
 
         if validation["overall_passed"]:
-            _accept_file(filepath, code, task, attempt, generated_files,
-                         file_diffs, project_dir)
-            log_action("CodeGenAgent",
-                       f"  ✓ {filepath}",
+            _accept_file(filepath, code, task, attempt,
+                         generated_files, file_diffs, project_dir)
+            log_action("CodeGenAgent", f"  ✓ {filepath}",
                        f"attempt={attempt} lines={len(code.splitlines())}")
             return True
         else:
@@ -255,58 +308,51 @@ def _generate_one_file(
                        f"  attempt {attempt}/{max_retries} failed: {filepath}",
                        last_error[:120], "WARN")
 
-    # ── All retries exhausted ─────────────────────────────────────────────────
-    # Accept the last generated code anyway if it at least passes syntax
+    # Accept with lint warnings if syntax is clean
     if last_code and run_syntax_check(last_code)["passed"]:
-        log_action("CodeGenAgent",
-                   f"  ⚠ Accepting with lint warnings: {filepath}", level="WARN")
-        _accept_file(filepath, last_code, task, attempt, generated_files,
-                     file_diffs, project_dir)
+        log_action("CodeGenAgent", f"  ⚠ Accepting with warnings: {filepath}", level="WARN")
+        _accept_file(filepath, last_code, task, attempt,
+                     generated_files, file_diffs, project_dir)
         return True
 
-    # True failure — insert placeholder
     placeholder = _make_placeholder(filepath, task, last_error)
-    _accept_file(filepath, placeholder, task, attempt, generated_files,
-                 file_diffs, project_dir, status="placeholder")
-    log_action("CodeGenAgent",
-               f"  ✗ PLACEHOLDER for {filepath}", last_error[:120], "ERROR")
+    _accept_file(filepath, placeholder, task, attempt,
+                 generated_files, file_diffs, project_dir, status="placeholder")
+    log_action("CodeGenAgent", f"  ✗ PLACEHOLDER: {filepath}", last_error[:120], "ERROR")
     return False
 
 
 def _generate_boilerplate(
-    state, filepath, task, arch_summary, client,
+    state, filepath, contract, client,
     generated_files, project_dir, debug_attempts, file_diffs,
 ) -> bool:
+    task_stub = {"id": "boilerplate", "title": filepath, "task_id": "bp"}
     prompt = (
-        f"Write the Python file `{filepath}`.\n"
-        f"Purpose: {task.get('description', task.get('title', ''))[:300]}\n"
-        f"Stack: {arch_summary[:300]}\n\n"
+        f"Write `{filepath}`.\n"
+        f"Purpose: {contract.get('purpose', filepath)}\n"
+        f"Required content:\n{contract.get('required_content', 'Standard Python module')}\n\n"
         "Output ONLY raw Python code."
     )
-    messages = [
-        {"role": "system", "content": BOILERPLATE_SYSTEM},
-        {"role": "user",   "content": prompt},
-    ]
-    response, usage = client.call_fast(messages, agent_name="CodeGenAgent")
+    response, usage = client.call_fast(
+        [{"role": "system", "content": BOILERPLATE_SYSTEM},
+         {"role": "user",   "content": prompt}],
+        agent_name="CodeGenAgent",
+    )
     _track(state, usage)
-    code = _clean_code(response)
-
-    if not code.strip():
-        code = f'"""{filepath} — generated by Forge"""\n'
-
+    code = _clean_code(response) or f'"""{filepath}"""\n'
     debug_attempts[filepath] = 1
-    _accept_file(filepath, code, task, 1, generated_files, file_diffs, project_dir)
+    _accept_file(filepath, code, task_stub, 1, generated_files, file_diffs, project_dir)
     log_action("CodeGenAgent", f"  ✓ {filepath} (boilerplate)")
     return True
 
 
 def _generate_non_python(
-    state, filepath, task, arch_summary, client,
-    generated_files, project_dir,
+    state, filepath, contract, client, generated_files, project_dir,
 ) -> bool:
     prompt = (
         f"Generate `{filepath}`.\n"
-        f"Context: {arch_summary[:400]}\n"
+        f"Context: {contract.get('purpose', '')}\n"
+        f"Details: {contract.get('required_content', '')}\n"
         "Output ONLY the file content. No explanation."
     )
     response, usage = client.call_fast(
@@ -314,186 +360,380 @@ def _generate_non_python(
     )
     _track(state, usage)
     content = _clean_code(response)
-
     generated_files[filepath] = content
-    out_path = project_dir / filepath
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(content)
+    out = project_dir / filepath
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(content)
     log_action("CodeGenAgent", f"  ✓ {filepath} (non-Python)")
     return True
 
 
-# ── Prompt builders ────────────────────────────────────────────────────────────
+# ── Contract system ───────────────────────────────────────────────────────────
 
-def _build_codegen_prompt(
-    filepath, task, arch_summary, priority_hint,
-    context_snippet, interfaces, prior_error,
-    existing_content="",
-) -> str:
-    parts = [f"Write the Python file: `{filepath}`"]
+def _build_file_contract(
+    filepath: str,
+    task: dict,
+    architecture: dict,
+    spec: dict,
+    generated_files: dict,
+    file_registry: dict,
+    fw_patterns: str,
+    is_extension: bool,
+    existing_content: str,
+) -> dict:
+    """
+    Build a per-file contract: what the file must import, define, and implement.
+    This is the key differentiator — each file gets a precise specification
+    derived from the actual project architecture, not a generic description.
+    """
+    name       = Path(filepath).stem.lower()
+    parent_dir = Path(filepath).parent.as_posix()
+    all_files  = list(generated_files.keys()) + [filepath]
 
-    if existing_content:
+    # ── Identify role of this file ────────────────────────────────────────────
+    role = _classify_file_role(filepath, task)
+
+    # ── Build import map: what exists and where ───────────────────────────────
+    import_map = _build_import_map(filepath, all_files, file_registry, generated_files)
+
+    # ── Extract endpoints, models, schemas from architecture ──────────────────
+    endpoints = [ep for ep in architecture.get("api_endpoints", [])
+                 if _endpoint_belongs_to_file(ep, filepath, task)]
+    models    = architecture.get("data_models", [])
+    schemas   = _derive_schemas_for_file(filepath, role, models, task)
+
+    # ── Build the contract dict ───────────────────────────────────────────────
+    contract = {
+        "filepath":        filepath,
+        "role":            role,
+        "purpose":         task.get("description", task.get("title", "")),
+        "framework_patterns": fw_patterns,
+        "import_rules":    import_map,
+        "must_define":     _what_to_define(role, filepath, endpoints, models, schemas, task),
+        "must_not_define": _what_not_to_define(role, file_registry),
+        "endpoints":       endpoints,
+        "models":          models[:3],
+        "schemas":         schemas,
+        "is_extension":    is_extension,
+        "required_content": _required_content_hint(role, task, architecture, spec),
+    }
+
+    return contract
+
+
+def _build_user_prompt(filepath: str, task: dict, contract: dict, existing: str) -> str:
+    """Build the user-facing prompt from the contract. Concrete and prescriptive."""
+    parts = []
+
+    if existing:
         parts.append(
-            f"\nIMPORTANT: This file already exists. You must EXTEND it with new code "
-            f"for this task. Keep all existing code intact. Add new functions/routes below.\n"
-            f"Existing file content:\n{existing_content[:1500]}"
+            f"EXTEND this existing file: `{filepath}`\n"
+            f"Keep ALL existing code. Add the new functionality below.\n\n"
+            f"Existing file:\n{existing[:2000]}\n\n"
+            f"New task to add: {task['title']}\n"
+            f"{task.get('description', '')[:400]}"
         )
     else:
-        parts.append(f"\nTask: {task['title']}")
-        parts.append(f"Description: {task['description'][:400]}")
-        parts.append(f"\nArchitecture context:\n{arch_summary}")
+        parts.append(f"Write the file: `{filepath}`")
+        parts.append(f"\nRole: {contract['role']}")
+        parts.append(f"Task: {task['title']}")
+        parts.append(f"Description: {task.get('description', '')[:400]}")
 
-    if interfaces:
-        parts.append(f"\nInterfaces this file must implement:\n{interfaces}")
-    if context_snippet and not existing_content:
-        parts.append(f"\nRelevant existing code (imports/interfaces):\n{context_snippet}")
-    parts.append(f"\nPriority: {priority_hint}")
-    if prior_error:
-        parts.append(f"\nPrevious attempt failed:\n{prior_error}")
-    parts.append(f"\nOutput ONLY the complete Python code for `{filepath}`. No markdown.")
+    # Framework patterns — always included
+    if contract.get("framework_patterns"):
+        parts.append(f"\n{contract['framework_patterns']}")
+
+    # Import rules — critical for correctness
+    if contract.get("import_rules"):
+        parts.append(f"\nIMPORT RULES (follow exactly):\n{contract['import_rules']}")
+
+    # What to define
+    if contract.get("must_define"):
+        parts.append(f"\nMUST DEFINE:\n{contract['must_define']}")
+
+    # What NOT to define — prevents hallucination of shared objects
+    if contract.get("must_not_define"):
+        parts.append(f"\nDO NOT DEFINE (these exist in other files — import them):\n{contract['must_not_define']}")
+
+    # Endpoints
+    if contract.get("endpoints"):
+        ep_lines = []
+        for ep in contract["endpoints"]:
+            ep_lines.append(
+                f"  {ep.get('method','GET')} {ep.get('path','/')} — {ep.get('description','')}"
+            )
+        parts.append(f"\nENDPOINTS TO IMPLEMENT:\n" + "\n".join(ep_lines))
+
+    # Schemas
+    if contract.get("schemas"):
+        parts.append(f"\nSCHEMAS:\n{contract['schemas']}")
+
+    # Models
+    if contract.get("models") and contract["role"] in ("model", "database"):
+        model_lines = []
+        for m in contract["models"]:
+            fields = ", ".join(
+                f"{f['name']}: {f['type']}"
+                for f in m.get("fields", [])[:8]
+            )
+            model_lines.append(f"  {m.get('name','')}: {fields}")
+        parts.append(f"\nDATA MODELS:\n" + "\n".join(model_lines))
+
+    parts.append(f"\nOutput ONLY raw Python code for `{filepath}`. No markdown. No explanation.")
     return "\n".join(parts)
 
 
-def _build_arch_summary(architecture: dict, spec: dict) -> str:
-    """Build a compact, token-efficient architecture description."""
-    lines = []
-    summary = spec.get("project_summary", "")
-    if summary:
-        lines.append(f"Project: {summary[:200]}")
-
-    stack = spec.get("inferred_stack", {})
-    if stack:
-        lines.append("Stack: " + ", ".join(f"{k}={v}" for k, v in stack.items()))
-
-    decisions = architecture.get("key_decisions", [])
-    if decisions:
-        lines.append("Decisions:")
-        for d in decisions[:4]:  # max 4
-            lines.append(f"  - {d.get('decision','')}: {d.get('rationale','')[:80]}")
-
-    endpoints = architecture.get("api_endpoints", [])
-    if endpoints:
-        lines.append("Endpoints:")
-        for ep in endpoints[:6]:  # max 6
-            lines.append(f"  {ep.get('method','')} {ep.get('path','')} — {ep.get('description','')[:60]}")
-
-    models = architecture.get("data_models", [])
-    if models:
-        lines.append("Models:")
-        for m in models[:3]:
-            fields = ", ".join(
-                f"{f['name']}:{f['type']}" for f in m.get("fields", [])[:5]
-            )
-            lines.append(f"  {m.get('name','')}: {fields}")
-
+def _contract_to_text(contract: dict) -> str:
+    """Compact text version of the contract for use in retry prompts."""
+    lines = [
+        f"Role: {contract.get('role', 'unknown')}",
+        f"Purpose: {contract.get('purpose', '')[:200]}",
+    ]
+    if contract.get("import_rules"):
+        lines.append(f"Import rules:\n{contract['import_rules']}")
+    if contract.get("must_not_define"):
+        lines.append(f"Do NOT define:\n{contract['must_not_define']}")
+    if contract.get("framework_patterns"):
+        lines.append(contract["framework_patterns"][:400])
     return "\n".join(lines)
 
 
-def _pick_context(filepath: str, generated_files: dict,
-                  max_files: int = 2, max_chars: int = 800) -> str:
+# ── Contract derivation helpers ────────────────────────────────────────────────
+
+def _classify_file_role(filepath: str, task: dict) -> str:
+    name  = Path(filepath).stem.lower()
+    parts = filepath.lower().split("/")
+    title = task.get("title", "").lower()
+
+    if "database" in name or "db" in name:          return "database"
+    if "model"    in name:                           return "model"
+    if "schema"   in name:                           return "schema"
+    if "router"   in parts or "router" in name:      return "router"
+    if "route"    in name or "endpoint" in name:     return "router"
+    if "main"     in name:                           return "main"
+    if "middleware" in name:                          return "middleware"
+    if "auth"     in name or "security" in name:     return "auth"
+    if "config"   in name or "settings" in name:     return "config"
+    if "test"     in name or "test" in parts:        return "test"
+    if "crud"     in name:                           return "crud"
+    return "module"
+
+
+def _build_import_map(
+    filepath: str,
+    all_files: list,
+    file_registry: dict,
+    generated_files: dict,
+) -> str:
     """
-    Pick the most relevant already-generated files as context.
-    Extracts the structurally important parts (imports, class/function signatures,
-    constants) rather than a raw line slice — so 800 chars covers real context.
+    Build explicit import rules for this file based on what's been generated.
+    This is what prevents the LLM from redefining Base, engine, app etc.
     """
-    if not generated_files:
+    rules = []
+    name  = Path(filepath).stem.lower()
+    role  = _classify_file_role(filepath, {"title": ""})
+
+    # Find the database file
+    db_file = next((f for f in all_files if "database" in f.lower() and f.endswith(".py")), None)
+    model_file = next((f for f in all_files if "model" in Path(f).stem.lower() and f.endswith(".py") and f != filepath), None)
+    schema_file = next((f for f in all_files if "schema" in Path(f).stem.lower() and f.endswith(".py") and f != filepath), None)
+    main_file  = next((f for f in all_files if Path(f).stem.lower() == "main" and f.endswith(".py") and f != filepath), None)
+
+    def to_module(fp: str) -> str:
+        return fp.replace("/", ".").removesuffix(".py")
+
+    if db_file and filepath != db_file:
+        db_mod = to_module(db_file)
+        if role in ("model",):
+            rules.append(f"from {db_mod} import Base  # import Base, never redefine it")
+        elif role in ("router", "crud", "main", "middleware"):
+            rules.append(f"from {db_mod} import get_db, SessionLocal")
+            if role == "main":
+                rules.append(f"from {db_mod} import Base, engine  # for init_db()")
+
+    if model_file and filepath != model_file and role in ("router", "crud", "main", "schema"):
+        mod_mod = to_module(model_file)
+        # Extract exported class names from the model file
+        model_code = generated_files.get(model_file, "")
+        classes = [l.split("(")[0].replace("class ", "").strip()
+                   for l in model_code.splitlines() if l.startswith("class ") and "(Base)" in l]
+        if classes:
+            rules.append(f"from {mod_mod} import {', '.join(classes[:4])}")
+        else:
+            rules.append(f"from {mod_mod} import <ModelClassName>  # import your model")
+
+    if schema_file and filepath != schema_file and role in ("router", "crud", "main"):
+        sch_mod = to_module(schema_file)
+        schema_code = generated_files.get(schema_file, "")
+        schema_classes = [l.split("(")[0].replace("class ", "").strip()
+                          for l in schema_code.splitlines()
+                          if l.startswith("class ") and "BaseModel" in l]
+        if schema_classes:
+            rules.append(f"from {sch_mod} import {', '.join(schema_classes[:6])}")
+        else:
+            rules.append(f"from {sch_mod} import <SchemaClasses>")
+
+    if rules:
+        return "\n".join(rules)
+    return ""
+
+
+def _what_to_define(
+    role: str, filepath: str, endpoints: list, models: list, schemas: str, task: dict
+) -> str:
+    lines = []
+    if role == "database":
+        lines += [
+            "class Base(DeclarativeBase): pass  ← the ONLY place Base is defined",
+            "engine = create_engine(DATABASE_URL, ...)",
+            "SessionLocal = sessionmaker(...)",
+            "def get_db() -> Generator[Session, None, None]  ← yields session",
+            "def init_db() -> None  ← calls Base.metadata.create_all()",
+        ]
+    elif role == "model":
+        for m in models[:3]:
+            fields = ", ".join(f"{f['name']}: {f['type']}" for f in m.get("fields", [])[:6])
+            lines.append(f"class {m.get('name','')}(Base): {fields}")
+    elif role == "schema":
+        lines.append(schemas or "Pydantic schemas with field_validator, ConfigDict(from_attributes=True)")
+    elif role == "router":
+        for ep in endpoints[:8]:
+            lines.append(f"{ep.get('method','GET')} {ep.get('path','/')} → {ep.get('description','')}")
+    elif role == "main":
+        lines += [
+            "app = FastAPI(title=..., lifespan=lifespan)",
+            "@asynccontextmanager async def lifespan(app): init_db(); yield",
+            "app.include_router(router, prefix=...)",
+            "GET /health → {status: ok}",
+        ]
+    elif role == "middleware":
+        lines.append("Middleware classes and validation helper functions")
+
+    return "\n".join(f"  - {l}" for l in lines) if lines else task.get("description", "")[:300]
+
+
+def _what_not_to_define(role: str, file_registry: dict) -> str:
+    """List shared objects that must be imported, not redefined."""
+    dont = []
+    if role != "database":
+        dont.append("Base, engine, SessionLocal, get_db  ← defined in database.py, import them")
+    if role not in ("main",):
+        dont.append("app = FastAPI()  ← defined in main.py only")
+    if role not in ("router", "main"):
+        dont.append("APIRouter  ← only create router in router files, not in main or models")
+    return "\n".join(f"  - {d}" for d in dont) if dont else ""
+
+
+def _derive_schemas_for_file(filepath: str, role: str, models: list, task: dict) -> str:
+    if role != "schema":
         return ""
-
-    fp_parts = set(Path(filepath).parts[:-1])
-    scored = []
-    for k, v in generated_files.items():
-        if k == filepath or "PLACEHOLDER" in (v or "")[:80]:
-            continue
-        k_parts = set(Path(k).parts[:-1])
-        # Score by directory overlap + penalise test files (less useful as context)
-        score = len(fp_parts & k_parts) - (1 if "test" in k else 0)
-        scored.append((score, k, v))
-
-    scored.sort(key=lambda x: -x[0])
-    selected = scored[:max_files]
-
-    snippets = []
-    for _, k, v in selected:
-        summary = _summarise_python_file(v, max_chars=max_chars // max(len(selected), 1))
-        if summary:
-            snippets.append(f"# {k}\n{summary}")
-
-    return "\n\n".join(snippets)
-
-
-def _summarise_python_file(code: str, max_chars: int = 400) -> str:
-    """
-    Extract structurally meaningful parts of a Python file:
-    imports, class/function signatures, decorators, key assignments.
-    Skips function bodies — the caller only needs to know what exists, not how it works.
-    """
-    if not code or len(code) < 10:
-        return ""
-
-    important = []
-    prev_was_def = False
-
-    for line in code.splitlines():
-        stripped = line.strip()
-
-        is_structural = (
-            stripped.startswith((
-                "import ", "from ", "class ", "def ", "async def ", "@",
-                "__all__", "app =", "router =", "db =", "engine =",
-                "Base =", "SessionLocal =", "DATABASE_URL",
-            ))
-            or "= Base" in stripped
-            or "Column(" in stripped
-            or "relationship(" in stripped
+    lines = []
+    for m in models[:3]:
+        name  = m.get("name", "Item")
+        fields = m.get("fields", [])
+        field_str = "\n    ".join(
+            f"{f['name']}: {_py_type(f.get('type', 'str'))}"
+            for f in fields if f.get("name") != "id"
         )
-
-        if is_structural:
-            important.append(line)
-            prev_was_def = stripped.startswith(("def ", "async def ", "class "))
-            continue
-
-        # Keep the first docstring line immediately after a def/class
-        if prev_was_def and stripped.startswith('"""'):
-            important.append(line)
-            prev_was_def = False
-            continue
-
-        prev_was_def = False
-
-    result = "\n".join(important)
-    if len(result) > max_chars:
-        result = result[:max_chars] + "\n# ..."
-    return result
+        update_fields = "\n    ".join(
+            f"{f['name']}: Optional[{_py_type(f.get('type', 'str'))}] = None"
+            for f in fields if f.get("name") != "id"
+        ) or "pass"
+        lines.append(
+            f"class {name}Create(BaseModel):\n    {field_str or 'pass'}\n\n"
+            f"class {name}Update(BaseModel):  # all fields Optional\n"
+            f"    {update_fields}\n\n"
+            f"class {name}Response({name}Create):\n"
+            f"    id: int\n    model_config = ConfigDict(from_attributes=True)"
+        )
+    return "\n\n".join(lines)
 
 
-def _extract_interfaces(filepath: str, architecture_summary: str) -> str:
-    """Extract the API contract / interface hints relevant to this specific file."""
-    name = Path(filepath).stem.lower()
-    lines = [l for l in architecture_summary.splitlines()
-             if name in l.lower() or "endpoint" in l.lower()]
-    return "\n".join(lines[:10])
+def _endpoint_belongs_to_file(ep: dict, filepath: str, task: dict) -> bool:
+    """Check if an endpoint should be implemented in this file."""
+    name  = Path(filepath).stem.lower()
+    path  = ep.get("path", "").lower()
+    desc  = ep.get("description", "").lower()
+    title = task.get("title", "").lower()
+    # Endpoint belongs if the resource name matches the file name
+    # or the task title mentions the endpoint method/path
+    resource = path.split("/")[1] if "/" in path else ""
+    return (resource in name or name in resource or
+            ep.get("method", "").lower() in title or
+            any(word in title for word in path.split("/")))
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def _required_content_hint(role: str, task: dict, architecture: dict, spec: dict) -> str:
+    """One-line hint used for boilerplate and non-Python file generation."""
+    if role == "config":
+        return "Settings class using pydantic-settings or os.environ"
+    desc = task.get("description", task.get("title", ""))
+    stack = spec.get("inferred_stack", {})
+    return f"{desc} — Stack: {', '.join(f'{k}={v}' for k,v in stack.items())}"
 
-def _run_task_tests(task, test_file, test_files, generated_files,
-                    test_results, project_dir):
+
+def _detect_framework_patterns(stack: dict, architecture: dict) -> str:
+    """Build the framework version pattern string for injection into every prompt."""
+    stack_str = str(stack).lower()
+    patterns  = []
+
+    if "fastapi" in stack_str or any(
+        "fastapi" in str(d).lower()
+        for d in architecture.get("key_decisions", [])
+    ):
+        patterns.append(FRAMEWORK_PATTERNS["fastapi"])
+
+    # Always inject Pydantic v2 — it's the current standard
+    patterns.append(FRAMEWORK_PATTERNS["pydantic_v2"])
+
+    # Always inject SQLAlchemy 2.x if any DB is mentioned
+    if any(x in stack_str for x in ("sqlite", "postgres", "mysql", "mongo", "db", "sql")):
+        patterns.append(FRAMEWORK_PATTERNS["sqlalchemy_2"])
+
+    return "\n".join(patterns)
+
+
+def _py_type(schema_type: str) -> str:
+    """Convert architecture schema type to Python type hint."""
+    mapping = {
+        "int": "int", "integer": "int", "float": "float", "number": "float",
+        "str": "str", "string": "str", "bool": "bool", "boolean": "bool",
+        "date": "date", "datetime": "datetime", "list": "list", "dict": "dict",
+    }
+    return mapping.get(schema_type.lower(), "str")
+
+
+# ── File registry ─────────────────────────────────────────────────────────────
+
+def _register_file(filepath: str, code: str, file_registry: dict) -> None:
+    """Track what classes and functions a file exports."""
+    classes   = []
+    functions = []
+    for line in (code or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("class ") and "(":
+            classes.append(stripped.split("(")[0].replace("class ", "").strip())
+        elif stripped.startswith("def ") or stripped.startswith("async def "):
+            fn = stripped.split("(")[0].replace("async def ", "").replace("def ", "").strip()
+            functions.append(fn)
+    file_registry[filepath] = {"classes": classes, "functions": functions}
+
+
+# ── Test runner ───────────────────────────────────────────────────────────────
+
+def _run_task_tests(
+    task, test_file, test_files, generated_files, test_results, project_dir
+) -> None:
     test_code  = test_files.get(test_file, "")
     impl_files = [f for f in task.get("files", []) if f.endswith(".py")]
     if not impl_files:
         return
-
     impl_filepath = impl_files[0]
-    impl_code = generated_files.get(impl_filepath, "")
+    impl_code     = generated_files.get(impl_filepath, "")
     if not impl_code or "PLACEHOLDER" in impl_code[:80]:
         return
-
-    # Pass all generated files so cross-module imports (from app.models import ...)
-    # resolve correctly in the temp dir.
     result = run_pytest(
-        test_code,
-        impl_code,
-        Path(impl_filepath).name,
+        test_code, impl_code, Path(impl_filepath).name,
         all_generated_files=generated_files,
     )
     test_results[test_file] = result
@@ -502,12 +742,16 @@ def _run_task_tests(task, test_file, test_files, generated_files,
                f"passed={result['tests_passed']} failed={result['tests_failed']}")
 
 
-def _accept_file(filepath, code, task, attempt, generated_files,
-                 file_diffs, project_dir, status="generated"):
+# ── Utility helpers ───────────────────────────────────────────────────────────
+
+def _accept_file(
+    filepath, code, task, attempt, generated_files, file_diffs, project_dir,
+    status="generated",
+) -> None:
     generated_files[filepath] = code
     file_diffs.append({
         "filepath": filepath,
-        "task_id":  task["id"],
+        "task_id":  task.get("id", task.get("task_id", "?")),
         "attempt":  attempt,
         "lines":    len(code.splitlines()),
         "status":   status,
@@ -517,23 +761,21 @@ def _accept_file(filepath, code, task, attempt, generated_files,
     out_path.write_text(code)
 
 
-def _track(state, usage):
+def _track(state, usage) -> None:
     state["api_call_count"] = state.get("api_call_count", 0) + 1
     state["total_tokens"]   = state.get("total_tokens", 0) + usage["total_tokens"]
 
 
 def _is_boilerplate(filepath: str) -> bool:
-    name = Path(filepath).name
-    return any(name == p or name.endswith(p) for p in BOILERPLATE_PATTERNS)
+    return Path(filepath).name in BOILERPLATE_PATTERNS
 
 
 def _clean_code(raw: str) -> str:
-    """Strip markdown fences. Handles ```python, ```py, ``` variants."""
+    """Strip markdown fences from LLM output."""
     raw = raw.strip()
     if raw.startswith("```"):
         lines = raw.split("\n")
-        # Drop first line (the fence opener) and find closing fence
-        end = len(lines) - 1
+        end   = len(lines) - 1
         while end > 0 and lines[end].strip().startswith("```"):
             end -= 1
         raw = "\n".join(lines[1:end + 1])
@@ -545,17 +787,17 @@ def _priority_hint(weights: dict) -> str:
         return "balanced"
     top = max(weights, key=weights.get)
     return {
-        "security":      "security-first (validate inputs, parameterised queries, no eval)",
-        "quality":       "quality-first (type hints, error handling, docstrings)",
-        "test_coverage": "testability-first (pure functions, small units, no hidden state)",
-        "speed":         "speed-first (minimal working implementation)",
-        "simplicity":    "simplicity-first (explicit over clever)",
+        "security":      "security-first",
+        "quality":       "quality-first",
+        "test_coverage": "testability-first",
+        "speed":         "speed-first",
+        "simplicity":    "simplicity-first",
     }.get(top, "balanced")
 
 
 def _make_placeholder(filepath: str, task: dict, error: str) -> str:
     return (
-        f'"""PLACEHOLDER — {filepath}\nTask: {task["title"]}\n'
+        f'"""PLACEHOLDER — {filepath}\nTask: {task.get("title","")}\n'
         f'Generation failed. Error: {(error or "unknown")[:200]}\n"""\n\n'
         f"raise NotImplementedError('Forge placeholder — manual implementation required')\n"
     )
